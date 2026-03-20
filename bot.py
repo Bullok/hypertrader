@@ -62,10 +62,14 @@ def get_candles():
     })
     candles = []
     for c in r[-60:]:
-        if isinstance(c, dict):
-            candles.append([c["t"], c["o"], c["h"], c["l"], c["c"], c.get("v", 0)])
-        else:
-            candles.append(c)
+        candles.append([
+            c["t"],
+            float(c["o"]),
+            float(c["h"]),
+            float(c["l"]),
+            float(c["c"]),
+            float(c.get("v", 0))
+        ])
     return candles
 
 def get_funding():
