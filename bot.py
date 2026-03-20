@@ -60,7 +60,13 @@ def get_candles():
             "endTime"  : int(time.time() * 1000)
         }
     })
-    return r[-60:]
+    candles = []
+    for c in r[-60:]:
+        if isinstance(c, dict):
+            candles.append([c["t"], c["o"], c["h"], c["l"], c["c"], c.get("v", 0)])
+        else:
+            candles.append(c)
+    return candles
 
 def get_funding():
     r   = post_info({"type": "metaAndAssetCtxs"})
