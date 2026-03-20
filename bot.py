@@ -192,7 +192,7 @@ def run():
         if STATE["start_value"] == 0.0:
             STATE["start_value"] = val
 
-        dd = (STATE["start_value"] - val) / STATE["start_value"]
+        dd = (STATE["start_value"] - val) / STATE["start_value"] if STATE["start_value"] > 0 else 0
         if dd >= CONFIG["max_dd_day"]:
             STATE["stop_day"] = True
             log(f"STOP DAY — drawdown {dd*100:.1f}% >= 3% | Capitale: ${val:.2f}")
