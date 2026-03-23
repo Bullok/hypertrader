@@ -62,14 +62,10 @@ def get_candles():
     })
     candles = []
     for c in r[-60:]:
-        candles.append([
-            c["t"],
-            float(c["o"]),
-            float(c["h"]),
-            float(c["l"]),
-            float(c["c"]),
-            float(c.get("v", 0))
-        ])
+        if isinstance(c, dict):
+            candles.append([c["t"], c["o"], c["h"], c["l"], c["c"], c.get("v", 0)])
+        else:
+            candles.append(c)
     return candles
 
 def get_funding():
@@ -192,7 +188,7 @@ def run():
         if STATE["start_value"] == 0.0:
             STATE["start_value"] = val
 
-        dd = (STATE["start_value"] - val) / STATE["start_value"] if STATE["start_value"] > 0 else 0
+        dd = (STATE["start_value"] - val) / STATE["start_value"]
         if dd >= CONFIG["max_dd_day"]:
             STATE["stop_day"] = True
             log(f"STOP DAY — drawdown {dd*100:.1f}% >= 3% | Capitale: ${val:.2f}")
@@ -266,18 +262,43 @@ def reset_day():
     STATE["start_value"] = 0.0
     log("Reset giornaliero — nuovo giorno")
 
+def test_trade(direction="long"):
+    """Apre un trade di test da 0.001 BTC per verificare connessione exchange."""
+    try:
+        log(f"TEST TRADE — apertura {direction.upper()} di test (0.001 BTC)")
+        val, pos = get_account()
+        log(f"Capitale letto: ${val:.2f} USDC")
+        if pos:
+            log(f"Posizione già aperta — chiudo prima")
+            market_close()
+            time.sleep(2)
+        set_leverage()
+        is_long = direction.lower() == "long"
+        res = place_order(is_long, 0.001, 0, "market")
+        log(f"Risposta exchange: {res}")
+        if "response" in res:
+            log(f"TEST OK — trade aperto correttamente")
+        else:
+            log(f"TEST FALLITO — risposta inattesa: {res}")
+    except Exception as e:
+        log(f"TEST ERRORE: {e}")
+
 if __name__ == "__main__":
+    import sys
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log("HyperTrader AI v5.2 — TESTNET AVVIATO")
     log("Capitale: ~900 USDC | Leva: 3x | Risk: 2% | BTC/USDC 1H")
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    schedule.every().hour.at(":01").do(run)
-    schedule.every().day.at("00:01").do(reset_day)
-
-    run()
-
-    log("Scheduler attivo — ciclo automatico ogni ora")
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        direction = sys.argv[2] if len(sys.argv) > 2 else "long"
+        test_trade(direction)
+    else:
+        schedule.every().hour.at(":01").do(run)
+        schedule.every().day.at("00:01").do(reset_day)
+        run()
+        log("Scheduler attivo — ciclo automatico ogni ora")
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+            
