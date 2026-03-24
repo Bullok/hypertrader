@@ -7,8 +7,8 @@ from datetime import timezone
 # ── config ───────────────────────────────────────────────────────────────────
 import os, sys
 
-KEY      = os.environ.get("HL_KEY", "")
-WALLET   = os.environ.get("HL_WALLET", "")
+KEY      = os.environ.get("KEY", "")
+WALLET   = os.environ.get("WALLET", "")
 BASE_URL = "https://api.hyperliquid-testnet.xyz"
 
 ACCT = Account.from_key(KEY)
