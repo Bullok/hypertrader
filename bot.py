@@ -76,7 +76,7 @@ def get_funding():
 
 def get_account():
     r   = post_info({"type": "clearinghouseState", "user": WALLET})
-    val = float(r["marginSummary"]["accountValue"])
+    val = val_raw
     pos = next(
         (p["position"] for p in r.get("assetPositions", [])
          if float(p["position"]["szi"]) != 0),
