@@ -1,19 +1,17 @@
-import os
-import time
-import json
-import hashlib
-import requests
-import pandas as pd
-import numpy as np
-import schedule
-from datetime import datetime, timezone
+import time, json, hashlib, requests, numpy as np, pandas as pd, schedule
+from datetime import datetime
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from datetime import timezone
 
+# ── config ───────────────────────────────────────────────────────────────────
+import os, sys
+
+KEY      = os.environ.get("HL_KEY", "")
+WALLET   = os.environ.get("HL_WALLET", "")
 BASE_URL = "https://api.hyperliquid-testnet.xyz"
-WALLET   = os.environ.get("WALLET")
-KEY      = os.environ.get("KEY")
-ACCT     = Account.from_key(KEY)
+
+ACCT = Account.from_key(KEY)
 
 CONFIG = {
     "coin"            : "BTC",
@@ -36,6 +34,7 @@ STATE = {
     "stop_day"   : False,
 }
 
+# ── helpers ───────────────────────────────────────────────────────────────────
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -50,13 +49,13 @@ def get_asset_index():
     r = post_info({"type": "metaAndAssetCtxs"})
     return next(i for i, x in enumerate(r[0]["universe"]) if x["name"] == CONFIG["coin"])
 
+# ── FIX: le due operazioni (balance USDC e candele) sono ora separate ─────────
 def get_candles():
-    r = post_info({"type": "spotClearinghouseState", "user": WALLET})
-val_raw = next((float(b["total"]) for b in r.get("balances", []) if b["coin"] == "USDC"), 0.0)
+    r = post_info({
         "type": "candleSnapshot",
         "req": {
-            "coin"    : CONFIG["coin"],
-            "interval": CONFIG["interval"],
+            "coin"     : CONFIG["coin"],
+            "interval" : CONFIG["interval"],
             "startTime": 0,
             "endTime"  : int(time.time() * 1000)
         }
@@ -74,9 +73,11 @@ def get_funding():
     idx = next(i for i, x in enumerate(r[0]["universe"]) if x["name"] == CONFIG["coin"])
     return float(r[1][idx]["funding"])
 
+# ── FIX: get_account calcola val internamente, non dipende da get_candles ─────
 def get_account():
-    r   = post_info({"type": "clearinghouseState", "user": WALLET})
-    val = val_raw
+    r   = post_info({"type": "clearinghouseState",     "user": WALLET})
+    r2  = post_info({"type": "spotClearinghouseState", "user": WALLET})
+    val = next((float(b["total"]) for b in r2.get("balances", []) if b["coin"] == "USDC"), 0.0)
     pos = next(
         (p["position"] for p in r.get("assetPositions", [])
          if float(p["position"]["szi"]) != 0),
@@ -111,7 +112,7 @@ def set_leverage():
 
 def place_order(is_buy, size, price, order_type):
     if order_type == "market":
-        t = {"market": {}}
+        t      = {"market": {}}
         reduce = False
     else:
         t = {
@@ -168,23 +169,24 @@ def compute(candles):
     pdm = np.where((up > dn) & (up > 0), up, 0.0)
     ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
 
-    atr_s = df["tr"].ewm(span=CONFIG["adx_len"], adjust=False).mean()
-    pdi   = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
-    ndi   = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
-    dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    atr_s     = df["tr"].ewm(span=CONFIG["adx_len"], adjust=False).mean()
+    pdi       = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
+    ndi       = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
+    dx        = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
     df["adx"] = dx.ewm(span=CONFIG["adx_len"], adjust=False).mean()
 
     return df.iloc[-2]
 
+# ── main loop ─────────────────────────────────────────────────────────────────
 def run():
     if STATE["stop_day"]:
         log("STOP DAY attivo — ciclo saltato")
         return
 
     try:
-        candles      = get_candles()
-        funding      = get_funding()
-        val, pos     = get_account()
+        candles  = get_candles()
+        funding  = get_funding()
+        val, pos = get_account()
 
         if STATE["start_value"] == 0.0:
             STATE["start_value"] = val
@@ -198,8 +200,8 @@ def run():
         row = compute(candles)
         log(
             f"Close=${row['close']:.0f} | "
-            f"DH=${row['dh']:.0f} | DL=${row['dl']:.0f} | "
-            f"ADX={row['adx']:.1f} | ATR=${row['atr']:.0f} | "
+            f"DH={row['dh']:.0f} | DL={row['dl']:.0f} | "
+            f"ADX={row['adx']:.1f} | ATR={row['atr']:.0f} | "
             f"Funding={funding*100:.4f}%"
         )
 
@@ -209,17 +211,17 @@ def run():
             log(
                 f"HOLD {'LONG' if is_long else 'SHORT'} | "
                 f"Entry=${float(pos['entryPx']):.0f} | "
-                f"PnL=${pnl:+.2f} USDC"
+                f"PnL={pnl:+.2f} USDC"
             )
             if row["adx"] < 20 and pnl > 0:
                 market_close()
-                log(f"CHIUSURA ANTICIPATA — ADX<20 + profitto | PnL=${pnl:+.2f}")
+                log(f"CHIUSURA ANTICIPATA — ADX<20 + profitto | PnL={pnl:+.2f}")
             return
 
         long_s  = bool(row["close"] > row["dh"] and row["adx"] > CONFIG["adx_threshold"])
         short_s = bool(row["close"] < row["dl"] and row["adx"] > CONFIG["adx_threshold"])
 
-        if long_s  and funding >  0.0005:
+        if long_s and funding > 0.0005:
             long_s = False
             log("Funding troppo alto — blocca LONG")
         if short_s and funding < -0.0005:
@@ -252,8 +254,8 @@ def run():
         log(f"Risposta exchange: {res}")
 
         time.sleep(1)
-        place_order(not is_long, size, sl, "sl")
-        place_order(not is_long, round(size * 0.6, 4), tp, "tp")
+        place_order(not is_long, size,               sl, "sl")
+        place_order(not is_long, round(size*0.6, 4), tp, "tp")
 
     except Exception as e:
         log(f"ERRORE: {e}")
@@ -270,26 +272,26 @@ def test_trade(direction="long"):
         val, pos = get_account()
         log(f"Capitale letto: ${val:.2f} USDC")
         if pos:
-            log(f"Posizione già aperta — chiudo prima")
+            log("Posizione già aperta — chiudo prima")
             market_close()
             time.sleep(2)
         set_leverage()
         is_long = direction.lower() == "long"
-        res = place_order(is_long, 0.001, 0, "market")
+        res     = place_order(is_long, 0.001, 0, "market")
         log(f"Risposta exchange: {res}")
         if "response" in res:
-            log(f"TEST OK — trade aperto correttamente")
+            log("TEST OK — trade aperto correttamente")
         else:
             log(f"TEST FALLITO — risposta inattesa: {res}")
     except Exception as e:
         log(f"TEST ERRORE: {e}")
 
+# ── entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log("=" * 50)
     log("HyperTrader AI v5.2 — TESTNET AVVIATO")
     log("Capitale: ~900 USDC | Leva: 3x | Risk: 2% | BTC/USDC 1H")
-    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log("=" * 50)
 
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         direction = sys.argv[2] if len(sys.argv) > 2 else "long"
@@ -302,4 +304,3 @@ if __name__ == "__main__":
         while True:
             schedule.run_pending()
             time.sleep(30)
-            
