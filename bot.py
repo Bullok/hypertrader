@@ -51,7 +51,8 @@ def get_asset_index():
     return next(i for i, x in enumerate(r[0]["universe"]) if x["name"] == CONFIG["coin"])
 
 def get_candles():
-    r = post_info({
+    r = post_info({"type": "spotClearinghouseState", "user": WALLET})
+val_raw = next((float(b["total"]) for b in r.get("balances", []) if b["coin"] == "USDC"), 0.0)
         "type": "candleSnapshot",
         "req": {
             "coin"    : CONFIG["coin"],
