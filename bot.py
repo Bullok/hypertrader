@@ -1,17 +1,19 @@
-import time, json, hashlib, requests, numpy as np, pandas as pd, schedule
-from datetime import datetime
-from eth_account import Account
-from eth_account.messages import encode_defunct
-from datetime import timezone
-
-# ── config ───────────────────────────────────────────────────────────────────
+import time, requests, numpy as np, pandas as pd, schedule
+from datetime import datetime, timezone
 import os, sys
 
-KEY      = os.environ.get("KEY", "")
-WALLET   = os.environ.get("WALLET", "")
-BASE_URL = "https://api.hyperliquid-testnet.xyz"
+from eth_account import Account
+from hyperliquid.exchange import Exchange
+from hyperliquid.info     import Info
+from hyperliquid.utils    import constants
 
-ACCT = Account.from_key(KEY)
+# ── config ───────────────────────────────────────────────────────────────────
+KEY    = os.environ.get("KEY", "")
+WALLET = os.environ.get("WALLET", "")
+
+ACCT     = Account.from_key(KEY)
+INFO     = Info(constants.TESTNET_API_URL, skip_ws=True)
+EXCHANGE = Exchange(ACCT, constants.TESTNET_API_URL, account_address=WALLET)
 
 CONFIG = {
     "coin"            : "BTC",
@@ -41,17 +43,9 @@ def now():
 def log(msg):
     print(f"[{now()}] {msg}", flush=True)
 
-def post_info(payload):
-    r = requests.post(f"{BASE_URL}/info", json=payload, timeout=15)
-    return r.json()
-
-def get_asset_index():
-    r = post_info({"type": "metaAndAssetCtxs"})
-    return next(i for i, x in enumerate(r[0]["universe"]) if x["name"] == CONFIG["coin"])
-
-# ── FIX: le due operazioni (balance USDC e candele) sono ora separate ─────────
 def get_candles():
-    r = post_info({
+    BASE_URL = constants.TESTNET_API_URL
+    r = requests.post(f"{BASE_URL}/info", json={
         "type": "candleSnapshot",
         "req": {
             "coin"     : CONFIG["coin"],
@@ -59,9 +53,10 @@ def get_candles():
             "startTime": 0,
             "endTime"  : int(time.time() * 1000)
         }
-    })
+    }, timeout=15)
+    data    = r.json()
     candles = []
-    for c in r[-60:]:
+    for c in data[-60:]:
         if isinstance(c, dict):
             candles.append([c["t"], c["o"], c["h"], c["l"], c["c"], c.get("v", 0)])
         else:
@@ -69,80 +64,51 @@ def get_candles():
     return candles
 
 def get_funding():
-    r   = post_info({"type": "metaAndAssetCtxs"})
-    idx = next(i for i, x in enumerate(r[0]["universe"]) if x["name"] == CONFIG["coin"])
-    return float(r[1][idx]["funding"])
+    meta = INFO.meta_and_asset_ctxs()
+    idx  = next(i for i, x in enumerate(meta[0]["universe"]) if x["name"] == CONFIG["coin"])
+    return float(meta[1][idx]["funding"])
 
-# ── FIX: get_account calcola val internamente, non dipende da get_candles ─────
 def get_account():
-    r   = post_info({"type": "clearinghouseState",     "user": WALLET})
-    r2  = post_info({"type": "spotClearinghouseState", "user": WALLET})
-    val = next((float(b["total"]) for b in r2.get("balances", []) if b["coin"] == "USDC"), 0.0)
+    user_state = INFO.user_state(WALLET)
+    spot_state = INFO.spot_user_state(WALLET)
+    val = next(
+        (float(b["total"]) for b in spot_state.get("balances", []) if b["coin"] == "USDC"),
+        0.0
+    )
     pos = next(
-        (p["position"] for p in r.get("assetPositions", [])
+        (p["position"] for p in user_state.get("assetPositions", [])
          if float(p["position"]["szi"]) != 0),
         None
     )
     return val, pos
 
-def sign_and_post(action):
-    ts      = int(time.time() * 1000)
-    payload = {"action": action, "nonce": ts, "vaultAddress": None}
-    msg_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    h       = hashlib.sha256(msg_str.encode()).digest()
-    signed  = ACCT.sign_message(encode_defunct(h))
-    body    = {
-        **payload,
-        "signature": {
-            "r": hex(signed.r),
-            "s": hex(signed.s),
-            "v": signed.v
-        }
-    }
-    r = requests.post(f"{BASE_URL}/exchange", json=body, timeout=15)
-    return r.json()
-
 def set_leverage():
-    sign_and_post({
-        "type"    : "updateLeverage",
-        "asset"   : get_asset_index(),
-        "isCross" : False,
-        "leverage": CONFIG["leverage"]
-    })
+    res = EXCHANGE.update_leverage(CONFIG["leverage"], CONFIG["coin"], is_cross=False)
+    log(f"Leva impostata: {res}")
 
 def place_order(is_buy, size, price, order_type):
+    coin = CONFIG["coin"]
     if order_type == "market":
-        t      = {"market": {}}
-        reduce = False
-    else:
-        t = {
-            "trigger": {
-                "triggerPx": str(round(price, 1)),
-                "isMarket" : order_type == "sl",
-                "tpsl"     : order_type
-            }
-        }
-        reduce = True
-
-    return sign_and_post({
-        "type"    : "order",
-        "orders"  : [{
-            "a": get_asset_index(),
-            "b": is_buy,
-            "p": str(round(price, 1)),
-            "s": str(round(size, 4)),
-            "r": reduce,
-            "t": t
-        }],
-        "grouping": "na"
-    })
+        return EXCHANGE.market_open(coin, is_buy, size)
+    elif order_type == "sl":
+        return EXCHANGE.order(
+            coin, not is_buy, size, price,
+            {"trigger": {"triggerPx": price, "isMarket": True,  "tpsl": "sl"}},
+            reduce_only=True
+        )
+    elif order_type == "tp":
+        return EXCHANGE.order(
+            coin, not is_buy, size, price,
+            {"trigger": {"triggerPx": price, "isMarket": False, "tpsl": "tp"}},
+            reduce_only=True
+        )
 
 def market_close():
     val, pos = get_account()
     if pos:
         is_long = float(pos["szi"]) > 0
         size    = abs(float(pos["szi"]))
-        place_order(not is_long, size, 0, "market")
+        EXCHANGE.market_close(CONFIG["coin"])
 
 def compute(candles):
     df = pd.DataFrame(
@@ -279,7 +245,7 @@ def test_trade(direction="long"):
         is_long = direction.lower() == "long"
         res     = place_order(is_long, 0.001, 0, "market")
         log(f"Risposta exchange: {res}")
-        if "response" in res:
+        if res and "response" in str(res):
             log("TEST OK — trade aperto correttamente")
         else:
             log(f"TEST FALLITO — risposta inattesa: {res}")
