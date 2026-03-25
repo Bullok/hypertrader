@@ -4,7 +4,6 @@ import os, sys
 
 from eth_account import Account
 from hyperliquid.exchange import Exchange
-from hyperliquid.info     import Info
 from hyperliquid.utils    import constants
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -12,8 +11,8 @@ KEY    = os.environ.get("KEY", "")
 WALLET = os.environ.get("WALLET", "")
 
 ACCT     = Account.from_key(KEY)
-INFO     = Info(constants.TESTNET_API_URL, skip_ws=True)
 EXCHANGE = Exchange(ACCT, constants.TESTNET_API_URL, account_address=WALLET)
+BASE_URL = constants.TESTNET_API_URL
 
 CONFIG = {
     "coin"            : "BTC",
@@ -43,9 +42,12 @@ def now():
 def log(msg):
     print(f"[{now()}] {msg}", flush=True)
 
+def post_info(payload):
+    r = requests.post(f"{BASE_URL}/info", json=payload, timeout=15)
+    return r.json()
+
 def get_candles():
-    BASE_URL = constants.TESTNET_API_URL
-    r = requests.post(f"{BASE_URL}/info", json={
+    data = post_info({
         "type": "candleSnapshot",
         "req": {
             "coin"     : CONFIG["coin"],
@@ -53,8 +55,7 @@ def get_candles():
             "startTime": 0,
             "endTime"  : int(time.time() * 1000)
         }
-    }, timeout=15)
-    data    = r.json()
+    })
     candles = []
     for c in data[-60:]:
         if isinstance(c, dict):
@@ -64,13 +65,13 @@ def get_candles():
     return candles
 
 def get_funding():
-    meta = INFO.meta_and_asset_ctxs()
+    meta = post_info({"type": "metaAndAssetCtxs"})
     idx  = next(i for i, x in enumerate(meta[0]["universe"]) if x["name"] == CONFIG["coin"])
     return float(meta[1][idx]["funding"])
 
 def get_account():
-    user_state = INFO.user_state(WALLET)
-    spot_state = INFO.spot_user_state(WALLET)
+    user_state = post_info({"type": "clearinghouseState",     "user": WALLET})
+    spot_state = post_info({"type": "spotClearinghouseState", "user": WALLET})
     val = next(
         (float(b["total"]) for b in spot_state.get("balances", []) if b["coin"] == "USDC"),
         0.0
@@ -106,8 +107,6 @@ def place_order(is_buy, size, price, order_type):
 def market_close():
     val, pos = get_account()
     if pos:
-        is_long = float(pos["szi"]) > 0
-        size    = abs(float(pos["szi"]))
         EXCHANGE.market_close(CONFIG["coin"])
 
 def compute(candles):
