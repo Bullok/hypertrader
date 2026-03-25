@@ -42,35 +42,24 @@ def post_info(payload):
     r = requests.post(f"{BASE_URL}/info", json=payload, timeout=15)
     return r.json()
 
-# ── EIP-712 signing ───────────────────────────────────────────────────────────
+# ── signing ───────────────────────────────────────────────────────────────────
 def sign_and_post(action):
-    nonce      = int(time.time() * 1000)
-    action_str = json.dumps(action, separators=(",", ":"), sort_keys=True)
-    action_hash = hashlib.sha256(action_str.encode()).digest()
-
-    # phantom_agent: keccak256(abi.encode(action_hash, nonce))
-    import eth_abi
-    encoded     = eth_abi.encode(["bytes32", "uint64"], [action_hash, nonce])
-    from eth_hash.auto import keccak
-    conn_id     = keccak(encoded)
-
-    signed = ACCT.sign_typed_data(
-        domain_data   = {"name": "Exchange", "version": "1", "chainId": 1337},
-        message_types = {"Agent": [
-            {"name": "source",       "type": "string"},
-            {"name": "connectionId", "type": "bytes32"},
-        ]},
-        message_data  = {
-            "source"      : "b",
-            "connectionId": conn_id
-        }
-    )
-
-    body = {
+    nonce   = int(time.time() * 1000)
+    payload = {
         "action"      : action,
         "nonce"       : nonce,
-        "signature"   : {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v},
         "vaultAddress": WALLET
+    }
+    msg_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    h       = hashlib.sha256(msg_str.encode()).digest()
+    signed  = ACCT.sign_message(encode_defunct(h))
+    body    = {
+        **payload,
+        "signature": {
+            "r": hex(signed.r),
+            "s": hex(signed.s),
+            "v": signed.v
+        }
     }
     r = requests.post(f"{BASE_URL}/exchange", json=body, timeout=15)
     return r.json()
