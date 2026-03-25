@@ -70,7 +70,7 @@ def sign_and_post(action):
         "action"      : action,
         "nonce"       : nonce,
         "signature"   : {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v},
-        "vaultAddress": None
+        "vaultAddress": WALLET
     }
     r = requests.post(f"{BASE_URL}/exchange", json=body, timeout=15)
     return r.json()
