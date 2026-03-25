@@ -1,16 +1,12 @@
 import time, requests, numpy as np, pandas as pd, schedule
 from datetime import datetime, timezone
-import os, sys, json
-
+import os, sys, json, hashlib
 from eth_account import Account
-from eth_account.structured_data.hashing import hash_domain, hash_message
-from eth_account._utils.structured_data.hashing import hash_domain as _hd
-import eth_abi
+from eth_account.messages import encode_defunct
 
 # ── config ───────────────────────────────────────────────────────────────────
-KEY    = os.environ.get("KEY", "")
-WALLET = os.environ.get("WALLET", "")
-
+KEY      = os.environ.get("KEY", "")
+WALLET   = os.environ.get("WALLET", "")
 ACCT     = Account.from_key(KEY)
 BASE_URL = "https://api.hyperliquid-testnet.xyz"
 
@@ -46,75 +42,34 @@ def post_info(payload):
     r = requests.post(f"{BASE_URL}/info", json=payload, timeout=15)
     return r.json()
 
-# ── EIP-712 signing (HyperLiquid style) ──────────────────────────────────────
-def sign_l1_action(action, nonce):
-    """
-    HyperLiquid usa EIP-712 con phantom_agent.
-    Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
-    """
-    import hashlib
-    from eth_account.messages import encode_defunct
-
-    # Serializza l'action e crea il phantom_agent hash
+# ── EIP-712 signing ───────────────────────────────────────────────────────────
+def sign_and_post(action):
+    nonce      = int(time.time() * 1000)
     action_str = json.dumps(action, separators=(",", ":"), sort_keys=True)
     action_hash = hashlib.sha256(action_str.encode()).digest()
 
-    # Struttura EIP-712
-    domain = {
-        "name"   : "Exchange",
-        "version": "1",
-        "chainId": 1337,  # testnet
-    }
-
-    # phantom_agent = keccak256(action_hash + nonce)
-    import eth_abi as _eth_abi
-    phantom_hash = _eth_abi.encode(
-        ["bytes32", "uint64"],
-        [action_hash, nonce]
-    )
-    import eth_hash.auto as _eth_hash
-    phantom_agent = _eth_hash.keccak(phantom_hash)
-
-    # Typed data
-    structured_data = {
-        "types": {
-            "EIP712Domain": [
-                {"name": "name",    "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-            ],
-            "Agent": [
-                {"name": "source",       "type": "string"},
-                {"name": "connectionId", "type": "bytes32"},
-            ]
-        },
-        "primaryType": "Agent",
-        "domain": domain,
-        "message": {
-            "source"      : "a",  # "a" = mainnet, "b" = testnet
-            "connectionId": "0x" + phantom_agent.hex()
-        }
-    }
+    # phantom_agent: keccak256(abi.encode(action_hash, nonce))
+    import eth_abi
+    encoded     = eth_abi.encode(["bytes32", "uint64"], [action_hash, nonce])
+    from eth_hash.auto import keccak
+    conn_id     = keccak(encoded)
 
     signed = ACCT.sign_typed_data(
-        domain_data    = structured_data["domain"],
-        message_types  = {"Agent": structured_data["types"]["Agent"]},
-        message_data   = structured_data["message"]
+        domain_data   = {"name": "Exchange", "version": "1", "chainId": 1337},
+        message_types = {"Agent": [
+            {"name": "source",       "type": "string"},
+            {"name": "connectionId", "type": "bytes32"},
+        ]},
+        message_data  = {
+            "source"      : "b",
+            "connectionId": conn_id
+        }
     )
 
-    return {
-        "r": hex(signed.r),
-        "s": hex(signed.s),
-        "v": signed.v
-    }
-
-def sign_and_post(action):
-    nonce = int(time.time() * 1000)
-    sig   = sign_l1_action(action, nonce)
-    body  = {
+    body = {
         "action"      : action,
         "nonce"       : nonce,
-        "signature"   : sig,
+        "signature"   : {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v},
         "vaultAddress": None
     }
     r = requests.post(f"{BASE_URL}/exchange", json=body, timeout=15)
@@ -176,10 +131,10 @@ def place_order(is_buy, size, price, order_type):
         t      = {"market": {}}
         reduce = False
     elif order_type == "sl":
-        t = {"trigger": {"triggerPx": str(round(price, 1)), "isMarket": True,  "tpsl": "sl"}}
+        t      = {"trigger": {"triggerPx": str(round(price, 1)), "isMarket": True,  "tpsl": "sl"}}
         reduce = True
     elif order_type == "tp":
-        t = {"trigger": {"triggerPx": str(round(price, 1)), "isMarket": False, "tpsl": "tp"}}
+        t      = {"trigger": {"triggerPx": str(round(price, 1)), "isMarket": False, "tpsl": "tp"}}
         reduce = True
     else:
         t      = {"market": {}}
