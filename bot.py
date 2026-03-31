@@ -31,8 +31,13 @@ WEEKLY_DD_LIMIT = 0.07
 state = {"daily_start_equity": None, "weekly_start_equity": None, "daily_stop": False, "weekly_risk_halved": False, "last_day": None, "last_week": None}
 
 def get_equity():
-    r = requests.post("https://api.hyperliquid.xyz/info", json={"type": "userState", "user": address}, headers={"Content-Type": "application/json"})
-    return 17.0  # saldo fisso temporaneo
+    from hyperliquid.info import Info
+    _info = Info(constants.MAINNET_API_URL, skip_ws=True)
+    spot = _info.spot_user_state(address)
+    for bal in spot.get('balances', []):
+        if bal['coin'] == 'USDC':
+            return float(bal['total'])
+    return 0.0
 
 def get_position():
     from hyperliquid.info import Info
