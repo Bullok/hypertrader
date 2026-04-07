@@ -1,163 +1,311 @@
-import json
-import time
-import eth_account
-import requests
-import pandas as pd
-import numpy as np
-from hyperliquid.exchange import Exchange
-from hyperliquid.utils import constants
+import time, requests, numpy as np, pandas as pd, schedule
 from datetime import datetime, timezone
+import os, sys, json, hashlib
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
-with open("config.json") as f:
-    config = json.load(f)
+# ── config ───────────────────────────────────────────────────────────────────
+KEY      = os.environ.get("KEY", "")
+WALLET   = os.environ.get("WALLET", "")
+ACCT     = Account.from_key(KEY)
+BASE_URL = "https://api.hyperliquid-testnet.xyz"
 
-wallet = eth_account.Account.from_key(config["secret_key"])
-address = config["account_address"]
-exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address=address)
+CONFIG = {
+    "coin"            : "BTC",
+    "interval"        : "1h",
+    "leverage"        : 3,
+    "adx_threshold"   : 25.0,
+    "donchian_len"    : 20,
+    "adx_len"         : 14,
+    "atr_len"         : 14,
+    "sl_atr"          : 2.0,
+    "tp_atr"          : 4.0,
+    "risk_per_trade"  : 0.02,
+    "max_notional_pct": 3.0,
+    "min_trade_usdc"  : 10.0,
+    "max_dd_day"      : 0.03,
+}
 
-SYMBOL = "BTC"
-RISK_PCT = 0.015
-LEVERAGE = 3
-DONCHIAN_PERIOD = 20
-ATR_PERIOD = 14
-ADX_PERIOD = 14
-ATR_SL_MULT = 2.0
-ATR_TP_MULT = 4.0
-MAX_FUNDING = 0.0005
-MAX_WICK_MULT = 3.0
-DAILY_DD_LIMIT = 0.03
-WEEKLY_DD_LIMIT = 0.07
+STATE = {
+    "start_value": 0.0,
+    "stop_day"   : False,
+}
 
-state = {"daily_start_equity": None, "weekly_start_equity": None, "daily_stop": False, "weekly_risk_halved": False, "last_day": None, "last_week": None}
+# ── helpers ───────────────────────────────────────────────────────────────────
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-def get_equity():
-    from hyperliquid.info import Info
-    _info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    spot = _info.spot_user_state(address)
-    for bal in spot.get('balances', []):
-        if bal['coin'] == 'USDC':
-            return float(bal['total'])
-    return 0.0
+def log(msg):
+    print(f"[{now()}] {msg}", flush=True)
 
-def get_position():
-    from hyperliquid.info import Info
-    _info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    state = _info.user_state(address)
-    for pos in state.get("assetPositions", []):
-        if pos["position"]["coin"] == SYMBOL:
-            szi = float(pos["position"]["szi"])
-            if szi != 0:
-                return "long" if szi > 0 else "short", abs(szi), float(pos["position"]["entryPx"])
-    return None, 0.0, 0.0
+def post_info(payload):
+    r = requests.post(f"{BASE_URL}/info", json=payload, timeout=15)
+    return r.json()
+
+# ── signing ───────────────────────────────────────────────────────────────────
+def sign_and_post(action):
+    nonce   = int(time.time() * 1000)
+    payload = {
+        "action"      : action,
+        "nonce"       : nonce,
+        "vaultAddress": WALLET
+    }
+    msg_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    h       = hashlib.sha256(msg_str.encode()).digest()
+    signed  = ACCT.sign_message(encode_defunct(h))
+    body    = {
+        **payload,
+        "signature": {
+            "r": hex(signed.r),
+            "s": hex(signed.s),
+            "v": signed.v
+        }
+    }
+    r = requests.post(f"{BASE_URL}/exchange", json=body, timeout=15)
+    return r.json()
+
+# ── trading functions ─────────────────────────────────────────────────────────
+def get_asset_index():
+    meta = post_info({"type": "metaAndAssetCtxs"})
+    return next(i for i, x in enumerate(meta[0]["universe"]) if x["name"] == CONFIG["coin"])
 
 def get_candles():
-    now = int(time.time() * 1000)
-    start = now - 100 * 3600 * 1000
-    r = requests.post("https://api.hyperliquid.xyz/info", json={"type": "candleSnapshot", "req": {"coin": SYMBOL, "interval": "1h", "startTime": start, "endTime": now}}, headers={"Content-Type": "application/json"})
-    df = pd.DataFrame(r.json(), columns=["t","T","s","i","o","c","h","l","v","n"])
-    return df.astype({"o": float, "h": float, "l": float, "c": float, "v": float})
-
-def calc_atr(df):
-    h, l, c = df["h"], df["l"], df["c"]
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=ATR_PERIOD, adjust=False).mean()
-
-def calc_adx(df):
-    h, l = df["h"], df["l"]
-    pdm = h.diff().clip(lower=0)
-    mdm = (-l.diff()).clip(lower=0)
-    pdm = pdm.where(pdm > mdm, 0.0)
-    mdm = mdm.where(mdm >= pdm, 0.0)
-    atr = calc_atr(df)
-    atr_safe = atr.replace(0, np.nan)
-    pdi = 100 * pdm.ewm(span=ADX_PERIOD, adjust=False).mean() / atr_safe
-    mdi = 100 * mdm.ewm(span=ADX_PERIOD, adjust=False).mean() / atr_safe
-    denom = (pdi + mdi).replace(0, np.nan)
-    dx = (100 * (pdi - mdi).abs() / denom).fillna(0)
-    return dx.ewm(span=ADX_PERIOD, adjust=False).mean()
+    data = post_info({
+        "type": "candleSnapshot",
+        "req": {
+            "coin"     : CONFIG["coin"],
+            "interval" : CONFIG["interval"],
+            "startTime": 0,
+            "endTime"  : int(time.time() * 1000)
+        }
+    })
+    candles = []
+    for c in data[-60:]:
+        if isinstance(c, dict):
+            candles.append([c["t"], c["o"], c["h"], c["l"], c["c"], c.get("v", 0)])
+        else:
+            candles.append(c)
+    return candles
 
 def get_funding():
-    r = requests.post("https://api.hyperliquid.xyz/info", json={"type": "metaAndAssetCtxs"}, headers={"Content-Type": "application/json"})
-    data = r.json()
-    for i, a in enumerate(data[0]["universe"]):
-        if a["name"] == SYMBOL:
-            return float(data[1][i].get("funding", 0))
-    return 0.0
+    meta = post_info({"type": "metaAndAssetCtxs"})
+    idx  = next(i for i, x in enumerate(meta[0]["universe"]) if x["name"] == CONFIG["coin"])
+    return float(meta[1][idx]["funding"])
 
-def calc_size(equity, atr, price, risk_pct):
-    if atr == 0:
-        return 0.0
-    return round((equity * risk_pct) / (atr * ATR_SL_MULT / price) / price, 5)
+def get_account():
+    user_state = post_info({"type": "clearinghouseState",     "user": WALLET})
+    spot_state = post_info({"type": "spotClearinghouseState", "user": WALLET})
+    val = next(
+        (float(b["total"]) for b in spot_state.get("balances", []) if b["coin"] == "USDC"),
+        0.0
+    )
+    pos = next(
+        (p["position"] for p in user_state.get("assetPositions", [])
+         if float(p["position"]["szi"]) != 0),
+        None
+    )
+    return val, pos
 
-def check_drawdown(equity):
-    now = datetime.now(timezone.utc)
-    today = now.date()
-    week = now.isocalendar()[1]
-    if state["last_day"] != today:
-        state["daily_start_equity"] = equity
-        state["daily_stop"] = False
-        state["last_day"] = today
-    if state["last_week"] != week:
-        state["weekly_start_equity"] = equity
-        state["weekly_risk_halved"] = False
-        state["last_week"] = week
-    if state["daily_start_equity"] and state["daily_start_equity"] > 0:
-        if (state["daily_start_equity"] - equity) / state["daily_start_equity"] >= DAILY_DD_LIMIT:
-            state["daily_stop"] = True
-            print("STOP giornaliero raggiunto")
-    if state["weekly_start_equity"] and state["weekly_start_equity"] > 0:
-        if (state["weekly_start_equity"] - equity) / state["weekly_start_equity"] >= WEEKLY_DD_LIMIT:
-            if not state["weekly_risk_halved"]:
-                state["weekly_risk_halved"] = True
-                print("Rischio dimezzato per drawdown settimanale")
-    return RISK_PCT * 0.5 if state["weekly_risk_halved"] else RISK_PCT
+def set_leverage():
+    res = sign_and_post({
+        "type"    : "updateLeverage",
+        "asset"   : get_asset_index(),
+        "isCross" : False,
+        "leverage": CONFIG["leverage"]
+    })
+    log(f"Leva impostata: {res}")
 
+def place_order(is_buy, size, price, order_type):
+    if order_type == "market":
+        t      = {"market": {}}
+        reduce = False
+    elif order_type == "sl":
+        t      = {"trigger": {"triggerPx": str(round(price, 1)), "isMarket": True,  "tpsl": "sl"}}
+        reduce = True
+    elif order_type == "tp":
+        t      = {"trigger": {"triggerPx": str(round(price, 1)), "isMarket": False, "tpsl": "tp"}}
+        reduce = True
+    else:
+        t      = {"market": {}}
+        reduce = False
+
+    return sign_and_post({
+        "type"    : "order",
+        "orders"  : [{
+            "a": get_asset_index(),
+            "b": is_buy,
+            "p": str(round(price, 1)) if price else "0",
+            "s": str(round(size, 4)),
+            "r": reduce,
+            "t": t
+        }],
+        "grouping": "na"
+    })
+
+def market_close():
+    val, pos = get_account()
+    if pos:
+        is_long = float(pos["szi"]) > 0
+        size    = abs(float(pos["szi"]))
+        place_order(not is_long, size, 0, "market")
+
+def compute(candles):
+    df = pd.DataFrame(
+        candles,
+        columns=["time", "open", "high", "low", "close", "volume"]
+    )
+    df = df.astype({c: float for c in ["open", "high", "low", "close", "volume"]})
+
+    n        = CONFIG["donchian_len"]
+    df["dh"] = df["high"].shift(1).rolling(n).max()
+    df["dl"] = df["low"].shift(1).rolling(n).min()
+
+    df["tr"] = np.maximum(
+        df["high"] - df["low"],
+        np.maximum(
+            (df["high"] - df["close"].shift(1)).abs(),
+            (df["low"]  - df["close"].shift(1)).abs()
+        )
+    )
+    df["atr"] = df["tr"].ewm(span=CONFIG["atr_len"], adjust=False).mean()
+
+    up  = df["high"].diff()
+    dn  = -df["low"].diff()
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
+
+    atr_s     = df["tr"].ewm(span=CONFIG["adx_len"], adjust=False).mean()
+    pdi       = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
+    ndi       = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
+    dx        = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    df["adx"] = dx.ewm(span=CONFIG["adx_len"], adjust=False).mean()
+
+    return df.iloc[-2]
+
+# ── main loop ─────────────────────────────────────────────────────────────────
 def run():
-    print("Bot avviato")
-    exchange.update_leverage(LEVERAGE, SYMBOL, is_cross=True)
-    print("Capitale: " + str(round(get_equity(), 2)) + " USDC")
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            print("\n[" + now.strftime("%H:%M:%S") + "] Analisi...")
-            df = get_candles().iloc[:-1]
-            close = df["c"].iloc[-1]
-            high_prev = df["h"].iloc[-DONCHIAN_PERIOD-1:-1].max()
-            low_prev = df["l"].iloc[-DONCHIAN_PERIOD-1:-1].min()
-            atr = calc_atr(df).iloc[-1]
-            adx = calc_adx(df).iloc[-1]
-            last = df.iloc[-1]
-            big_wick = max(last["h"]-max(last["o"],last["c"]), min(last["o"],last["c"])-last["l"]) > MAX_WICK_MULT * atr
-            funding = get_funding()
-            equity = get_equity()
-            risk = check_drawdown(equity)
-            print("Equity: " + str(round(equity,2)) + " | Close: " + str(round(close,1)) + " | ADX: " + str(round(adx,1)) + " | ATR: " + str(round(atr,1)))
-            pos_side, pos_size, entry_px = get_position()
-            if pos_side:
-                print("Posizione: " + pos_side + " | Entry: " + str(entry_px))
-                if adx < 20:
-                    in_profit = (pos_side == "long" and close > entry_px) or (pos_side == "short" and close < entry_px)
-                    if in_profit:
-                        print("ADX < 20 in profitto - chiudo")
-                        exchange.market_close(SYMBOL)
-            elif not state["daily_stop"]:
-                long_sig = close > high_prev and adx > 25 and not big_wick and abs(funding) <= MAX_FUNDING
-                short_sig = close < low_prev and adx > 25 and not big_wick and abs(funding) <= MAX_FUNDING
-                if adx < 20:
-                    print("Laterale - nessun trade")
-                elif long_sig:
-                    size = calc_size(equity, atr, close, risk)
-                    print("LONG | Size: " + str(size) + " | SL: " + str(round(close-atr*ATR_SL_MULT,1)) + " | TP: " + str(round(close+atr*ATR_TP_MULT,1)))
-                    print(exchange.market_open(SYMBOL, True, size))
-                elif short_sig:
-                    size = calc_size(equity, atr, close, risk)
-                    print("SHORT | Size: " + str(size) + " | SL: " + str(round(close+atr*ATR_SL_MULT,1)) + " | TP: " + str(round(close-atr*ATR_TP_MULT,1)))
-                    print(exchange.market_open(SYMBOL, False, size))
-                else:
-                    print("Nessun segnale")
-        except Exception as e:
-            print("Errore: " + str(e))
-        time.sleep(60)
+    if STATE["stop_day"]:
+        log("STOP DAY attivo — ciclo saltato")
+        return
 
+    try:
+        candles  = get_candles()
+        funding  = get_funding()
+        val, pos = get_account()
+
+        if STATE["start_value"] == 0.0:
+            STATE["start_value"] = val
+
+        dd = (STATE["start_value"] - val) / STATE["start_value"]
+        if dd >= CONFIG["max_dd_day"]:
+            STATE["stop_day"] = True
+            log(f"STOP DAY — drawdown {dd*100:.1f}% >= 3% | Capitale: ${val:.2f}")
+            return
+
+        row = compute(candles)
+        log(
+            f"Close=${row['close']:.0f} | "
+            f"DH={row['dh']:.0f} | DL={row['dl']:.0f} | "
+            f"ADX={row['adx']:.1f} | ATR={row['atr']:.0f} | "
+            f"Funding={funding*100:.4f}%"
+        )
+
+        if pos:
+            pnl     = float(pos["unrealizedPnl"])
+            is_long = float(pos["szi"]) > 0
+            log(
+                f"HOLD {'LONG' if is_long else 'SHORT'} | "
+                f"Entry=${float(pos['entryPx']):.0f} | "
+                f"PnL={pnl:+.2f} USDC"
+            )
+            if row["adx"] < 20 and pnl > 0:
+                market_close()
+                log(f"CHIUSURA ANTICIPATA — ADX<20 + profitto | PnL={pnl:+.2f}")
+            return
+
+        long_s  = bool(row["close"] > row["dh"] and row["adx"] > CONFIG["adx_threshold"])
+        short_s = bool(row["close"] < row["dl"] and row["adx"] > CONFIG["adx_threshold"])
+
+        if long_s and funding > 0.0005:
+            long_s = False
+            log("Funding troppo alto — blocca LONG")
+        if short_s and funding < -0.0005:
+            short_s = False
+            log("Funding troppo basso — blocca SHORT")
+
+        if not long_s and not short_s:
+            log("NO TRADE — nessun segnale valido")
+            return
+
+        is_long = long_s
+        atr     = row["atr"]
+        price   = row["close"]
+        sl      = price - atr * CONFIG["sl_atr"] if is_long else price + atr * CONFIG["sl_atr"]
+        tp      = price + atr * CONFIG["tp_atr"] if is_long else price - atr * CONFIG["tp_atr"]
+        risk    = val * CONFIG["risk_per_trade"]
+        size    = round(min(risk / abs(price - sl), val * CONFIG["max_notional_pct"] / price), 4)
+
+        if size * price < CONFIG["min_trade_usdc"]:
+            log("Size troppo piccola — skip")
+            return
+
+        set_leverage()
+        res = place_order(is_long, size, price, "market")
+        log(
+            f"{'LONG' if is_long else 'SHORT'} APERTO | "
+            f"Entry~${price:.0f} | SL=${sl:.0f} | TP=${tp:.0f} | "
+            f"Size={size} BTC | Rischio=${risk:.2f} USDC"
+        )
+        log(f"Risposta exchange: {res}")
+
+        time.sleep(1)
+        place_order(not is_long, size,               sl, "sl")
+        place_order(not is_long, round(size*0.6, 4), tp, "tp")
+
+    except Exception as e:
+        log(f"ERRORE: {e}")
+
+def reset_day():
+    STATE["stop_day"]    = False
+    STATE["start_value"] = 0.0
+    log("Reset giornaliero — nuovo giorno")
+
+def test_trade(direction="long"):
+    """Apre un trade di test da 0.001 BTC per verificare connessione exchange."""
+    try:
+        log(f"TEST TRADE — apertura {direction.upper()} di test (0.001 BTC)")
+        val, pos = get_account()
+        log(f"Capitale letto: ${val:.2f} USDC")
+        if pos:
+            log("Posizione già aperta — chiudo prima")
+            market_close()
+            time.sleep(2)
+        set_leverage()
+        is_long = direction.lower() == "long"
+        res     = place_order(is_long, 0.001, 0, "market")
+        log(f"Risposta exchange: {res}")
+        if res and "response" in str(res):
+            log("TEST OK — trade aperto correttamente")
+        else:
+            log(f"TEST FALLITO — risposta inattesa: {res}")
+    except Exception as e:
+        log(f"TEST ERRORE: {e}")
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    run()
+    log("=" * 50)
+    log("HyperTrader AI v5.2 — TESTNET AVVIATO")
+    log("Capitale: ~900 USDC | Leva: 3x | Risk: 2% | BTC/USDC 1H")
+    log("=" * 50)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        direction = sys.argv[2] if len(sys.argv) > 2 else "long"
+        test_trade(direction)
+    else:
+        schedule.every().hour.at(":01").do(run)
+        schedule.every().day.at("00:01").do(reset_day)
+        run()
+        log("Scheduler attivo — ciclo automatico ogni ora")
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
