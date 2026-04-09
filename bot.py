@@ -60,7 +60,7 @@ def sign_and_post(action):
     payload = {
         "action"      : action,
         "nonce"       : nonce,
-        "vaultAddress": WALLET
+        "agentAddress": WALLET
     }
     msg_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     h       = hashlib.sha256(msg_str.encode()).digest()
@@ -108,7 +108,7 @@ def get_funding():
 def get_account():
     user_state = post_info({"type": "clearinghouseState",     "user": WALLET})
     spot_state = post_info({"type": "spotClearinghouseState", "user": WALLET})
-    val = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+    val = float(next((b["total"] for b in spot_state.get("balances", []) if b["coin"] == "USDC"), 0))
     pos = next(
         (p["position"] for p in user_state.get("assetPositions", [])
          if float(p["position"]["szi"]) != 0),
