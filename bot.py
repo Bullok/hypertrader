@@ -11,7 +11,7 @@ KEY    = os.environ.get("KEY", "")
 WALLET = os.environ.get("WALLET", "")
 ACCT   = Account.from_key(KEY) if KEY else None
 
-BASE_URL = "https://api.hyperliquid-testnet.xyz"
+BASE_URL = "https://api.hyperliquid.xyz"
 
 CONFIG = {
     "coin"             : "BTC",
@@ -108,10 +108,7 @@ def get_funding():
 def get_account():
     user_state = post_info({"type": "clearinghouseState",     "user": WALLET})
     spot_state = post_info({"type": "spotClearinghouseState", "user": WALLET})
-    val = next(
-        (float(b["total"]) for b in spot_state.get("balances", []) if b["coin"] == "USDC"),
-        0.0
-    )
+    val = float(user_state.get("marginSummary", {}).get("accountValue", 0))
     pos = next(
         (p["position"] for p in user_state.get("assetPositions", [])
          if float(p["position"]["szi"]) != 0),
@@ -219,9 +216,9 @@ def compute(candles):
     ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
 
     atr_s = df["tr"].ewm(span=CONFIG["adx_len"], adjust=False).mean()
-    pdi   = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
-    ndi   = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
-    dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    pdi   = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / (atr_s + 1e-10).replace(0, 1e-10).replace(0, 1e-10)
+    ndi   = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / (atr_s + 1e-10).replace(0, 1e-10).replace(0, 1e-10)
+    dx    = 100 * (pdi - ndi).abs() / (pdi + ndi + 1e-10).replace(0, np.nan)
     df["adx"] = dx.ewm(span=CONFIG["adx_len"], adjust=False).mean()
 
     return df.iloc[-2]
@@ -241,7 +238,7 @@ def run():
         if STATE["start_value"] == 0.0:
             STATE["start_value"] = val
 
-        dd = (STATE["start_value"] - val) / STATE["start_value"]
+        dd = (STATE["start_value"] - val) / STATE["start_value"] if STATE["start_value"] > 0 else 0
         if dd >= CONFIG["max_dd_day"]:
             STATE["stop_day"] = True
             log(f"STOP DAY — drawdown {dd*100:.1f}% >= 3% | Capitale: ${val:.2f}")
@@ -317,7 +314,7 @@ def run():
         tp      = price + atr * CONFIG["tp_atr"] if is_long else price - atr * CONFIG["tp_atr"]
 
         risk    = val * CONFIG["risk_per_trade"]
-        size    = round(min(risk / abs(price - sl), val * CONFIG["max_notional_pct"] / price), 4)
+        size    = round(min(risk / (abs(price - sl) + 1e-10), val * CONFIG["max_notional_pct"] / price), 4)
 
         if size * price < CONFIG["min_trade_usdc"]:
             log(f"Size troppo piccola (${size*price:.2f}) — skip")
@@ -339,6 +336,7 @@ def run():
         place_order(not is_long, round(size * 0.6, 4), tp, "tp")
 
     except Exception as e:
+        import traceback; traceback.print_exc()
         log(f"ERRORE: {e}")
 
 def reset_day():
@@ -374,9 +372,9 @@ def backtest(candles_raw, capital=900.0, leverage=5):
     pdm = np.where((up > dn) & (up > 0), up, 0.0)
     ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
     atr_s      = df["tr"].ewm(span=CONFIG["adx_len"], adjust=False).mean()
-    pdi        = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
-    ndi        = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / atr_s
-    dx         = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    pdi        = 100 * pd.Series(pdm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / (atr_s + 1e-10).replace(0, 1e-10).replace(0, 1e-10)
+    ndi        = 100 * pd.Series(ndm, index=df.index).ewm(span=CONFIG["adx_len"], adjust=False).mean() / (atr_s + 1e-10).replace(0, 1e-10).replace(0, 1e-10)
+    dx         = 100 * (pdi - ndi).abs() / (pdi + ndi + 1e-10).replace(0, np.nan)
     df["adx"]  = dx.ewm(span=CONFIG["adx_len"], adjust=False).mean()
     df         = df.dropna().reset_index(drop=True)
 
