@@ -109,17 +109,17 @@ def place_order(is_buy, size, price, order_type):
                 {"limit": {"tif": "Ioc"}}
             )
         elif order_type == "sl":
-            trigger_px = int(round(price))
+            trigger_px = float(int(round(price)))
             res = exchange.order(
                 CONFIG["coin"], is_buy, size, trigger_px,
-                {"trigger": {"triggerPx": str(trigger_px), "isMarket": True, "tpsl": "sl"}},
+                {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "sl"}},
                 reduce_only=True
             )
         elif order_type == "tp":
-            trigger_px = int(round(price))
+            trigger_px = float(int(round(price)))
             res = exchange.order(
                 CONFIG["coin"], is_buy, size, trigger_px,
-                {"trigger": {"triggerPx": str(trigger_px), "isMarket": False, "tpsl": "tp"}},
+                {"trigger": {"triggerPx": trigger_px, "isMarket": False, "tpsl": "tp"}},
                 reduce_only=True
             )
         else:
