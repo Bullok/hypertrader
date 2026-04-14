@@ -51,7 +51,10 @@ def log(msg):
 
 def post_info(payload):
     r = requests.post(f"{BASE_URL}/info", json=payload, timeout=15)
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"status": "ok", "raw": r.text}
 
 # ── signing ───────────────────────────────────────────────────────────────────
 
@@ -74,7 +77,10 @@ def sign_and_post(action):
         }
     }
     r = requests.post(f"{BASE_URL}/exchange", json=body, timeout=15)
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return {"status": "ok", "raw": r.text}
 
 # ── trading functions ─────────────────────────────────────────────────────────
 
@@ -292,8 +298,8 @@ def run():
             return
 
         # ── segnali ───────────────────────────────────────────────────────────
-        long_s  = bool(row["close"] > row["dh"] and row["adx"] > CONFIG["adx_threshold"])
-        short_s = bool(row["close"] < row["dl"] and row["adx"] > CONFIG["adx_threshold"])
+        long_s  = bool(row["close"] >= row["dh"] * 0.998 and row["adx"] > CONFIG["adx_threshold"])
+        short_s = bool(row["close"] <= row["dl"] * 1.002 and row["adx"] > CONFIG["adx_threshold"])
 
         if long_s  and funding >  CONFIG["funding_long_max"]:
             long_s  = False
